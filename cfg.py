@@ -33,15 +33,16 @@ Cfg.policy = Cfg.steps
 Cfg.scales = .1, .1
 
 Cfg.cutmix = 0
-Cfg.mosaic = 1
+Cfg.mosaic = 0
+Cfg.mixup = 0
 
 Cfg.letter_box = 0
 Cfg.jitter = 0.2
-Cfg.classes = 80
+Cfg.classes = 1
 Cfg.track = 0
 Cfg.w = Cfg.width
 Cfg.h = Cfg.height
-Cfg.flip = 1
+Cfg.flip = 0
 Cfg.blur = 0
 Cfg.gaussian = 0
 Cfg.boxes = 60  # box num

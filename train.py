@@ -24,6 +24,7 @@ from models import Yolov4
 import argparse
 from easydict import EasyDict as edict
 from torch.nn import functional as F
+from evaluate_on_trees import test
 
 import numpy as np
 
@@ -163,7 +164,7 @@ class Yolo_loss(nn.Module):
             truth_box[:n, 0] = truth_x_all[b, :n]
             truth_box[:n, 1] = truth_y_all[b, :n]
 
-            pred_ious = bboxes_iou(pred[b].view(-1, 4), truth_box, xyxy=False)
+            pred_ious = bboxes_iou(pred[b].reshape(-1, 4), truth_box, xyxy=False)
             pred_best_iou, _ = pred_ious.max(dim=1)
             pred_best_iou = (pred_best_iou > self.ignore_thre)
             pred_best_iou = pred_best_iou.view(pred[b].shape[:3])
@@ -242,6 +243,9 @@ def collate(batch):
     bboxes = torch.from_numpy(bboxes)
     return images, bboxes
 
+def val_collate(batch):
+    return tuple(zip(*batch))
+
 
 def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5):
     train_dataset = Yolo_dataset(config.train_label, config)
@@ -251,10 +255,10 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     n_val = len(val_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch // config.subdivisions, shuffle=True,
-                              num_workers=8, pin_memory=True, drop_last=True, collate_fn=collate)
+                              num_workers=6, pin_memory=True, drop_last=True, collate_fn=collate)
 
-    val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=8,
-                            pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, 
+                            pin_memory=True, drop_last=True, collate_fn=collate)
 
     writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
                            filename_suffix=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}',
@@ -297,12 +301,13 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, burnin_schedule)
 
     criterion = Yolo_loss(device=device, batch=config.batch // config.subdivisions,n_classes=config.classes)
+    val_criterion = Yolo_loss(device=device, batch=1,n_classes=config.classes)
     # scheduler = ReduceLROnPlateau(optimizer, mode='max', verbose=True, patience=6, min_lr=1e-7)
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
     model.train()
     for epoch in range(epochs):
-        #model.train()
+        model.train()
         epoch_loss = 0
         epoch_step = 0
 
@@ -354,15 +359,51 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
                 pbar.update(images.shape[0])
 
-            if save_cp:
-                try:
-                    os.mkdir(config.checkpoints)
-                    logging.info('Created checkpoint directory')
-                except OSError:
-                    pass
-                torch.save(model.state_dict(), os.path.join(config.checkpoints, f'Yolov4_epoch{epoch + 1}.pth'))
-                logging.info(f'Checkpoint {epoch + 1} saved !')
+                if global_step % 100 == 0 and cfg.val_dir is not None:
+                    model.eval()
+                    torch.cuda.empty_cache()
+                    val_loss, val_loss_xy, val_loss_wh, val_loss_obj, val_loss_cls, val_loss_l2 = 0, 0, 0, 0, 0, 0
+                    val_step = 0
 
+                    for j, batch_val in enumerate(val_loader):
+                        images = batch_val[0]
+                        bboxes = batch_val[1]
+
+                        images = images.to(device=device, dtype=torch.float32)
+                        bboxes = bboxes.to(device=device)
+                        with torch.no_grad():
+                            bboxes_pred = model(images)
+                            loss, loss_xy, loss_wh, loss_obj, loss_cls, loss_l2 = val_criterion(bboxes_pred, bboxes)
+                        val_loss += loss
+                        val_loss_xy += loss_xy
+                        val_loss_wh += loss_wh
+                        val_loss_obj += loss_obj
+                        val_loss_cls += loss_cls
+                        val_loss_l2 += loss_l2
+                        val_step += 1
+
+                    writer.add_scalar('val/Loss', val_loss/val_step, global_step)
+                    writer.add_scalar('val/loss_xy', val_loss_xy/val_step, global_step)
+                    writer.add_scalar('val/loss_wh', val_loss_wh/val_step, global_step)
+                    writer.add_scalar('val/loss_obj', val_loss_obj/val_step, global_step)
+                    writer.add_scalar('val/loss_cls', val_loss_cls/val_step, global_step)
+                    writer.add_scalar('val/loss_l2', val_loss_l2/val_step, global_step)
+                        
+                    model.train()
+                    if save_cp:
+                        try:
+                            os.mkdir(config.checkpoints)
+                            logging.info('Created checkpoint directory')
+                        except OSError:
+                            pass
+                        torch.save(model.state_dict(), os.path.join(config.checkpoints, f'Yolov4_epoch{epoch + 1}_{int(global_step / 1000)}.pth'))
+                        logging.info(f'Checkpoint {epoch + 1} saved !')
+
+                # if global_step % 1000 == 0 and cfg.val_dir is not None and global_step> 2000:
+                #     metrics = test(model, cfg.val_dir)
+                #     if metrics is not None:
+                #         writer.add_scalar('val/AP50', metrics["AP"], global_step)   
+            
     writer.close()
 
 
@@ -383,7 +424,9 @@ def get_args(**kwargs):
     parser.add_argument('-pretrained',type=str,default=None,help='pretrained yolov4.conv.137')
     parser.add_argument('-classes',type=int,default=80,help='dataset classes')
     parser.add_argument('-train_label_path',dest='train_label',type=str,default='train.txt',help="train label path")
+    parser.add_argument('-val_label_path', dest='val_label', type=str, default='val.txt', help='validate label path')
     parser.add_argument('-epochs',dest='TRAIN_EPOCHS',type=int,default=10,help="number of training epochs")
+    parser.add_argument('-val', dest='val_dir', help='validation dataset directory', type=str, default=None)
     args = vars(parser.parse_args())
 
     for k in args.keys():
@@ -429,6 +472,7 @@ def init_logger(log_file=None, log_dir=None, log_level=logging.INFO, mode='w', s
 
 if __name__ == "__main__":
     logging = init_logger(log_dir='log')
+    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
     cfg = get_args(**Cfg)
     os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

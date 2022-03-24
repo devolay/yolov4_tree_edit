@@ -458,7 +458,9 @@ if  __name__ == "__main__":
     sized = img.resize((608, 608))
     from tool.utils import *
 
-    boxes = do_detect(model, sized, 0.5, n_classes,0.4, use_cuda)
+    boxes = do_detect(model, sized, 0.25, n_classes, 0.4, use_cuda)
+    path = "/".join(imgfile.split('/')[:-1])
+    gt_boxes = parse_annotations(path)[imgfile.split('/')[-1]]
 
     class_names = load_class_names(namesfile)
-    plot_boxes(img, boxes, 'predictions.jpg', class_names)
+    plot_boxes_with_gt(img, boxes, gt_boxes, 'predictions.jpg', class_names)
